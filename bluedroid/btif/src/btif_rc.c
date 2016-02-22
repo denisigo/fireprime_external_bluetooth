@@ -807,12 +807,45 @@ void btif_rc_handler(tBTA_AV_EVT event, tBTA_AV *p_data)
         break;
         case BTA_AV_META_MSG_EVT:
         {
-            BTIF_TRACE_DEBUG("BTA_AV_META_MSG_EVT  code:%d label:%d", p_data->meta_msg.code,
-                p_data->meta_msg.label);
-            BTIF_TRACE_DEBUG("  company_id:0x%x len:%d handle:%d", p_data->meta_msg.company_id,
-                p_data->meta_msg.len, p_data->meta_msg.rc_handle);
-            /* handle the metamsg command */
-            handle_rc_metamsg_cmd(&(p_data->meta_msg));
+            BTIF_TRACE_DEBUG("BTA_AV_META_MSG_EVT  code:%d label:%d",
+                                            p_data->meta_msg.code,
+                                            p_data->meta_msg.label);
+            BTIF_TRACE_DEBUG(" ctype:%d company_id:0x%x len:%d handle:%d",
+                                        p_data->meta_msg.p_msg->hdr.ctype,
+                                        p_data->meta_msg.company_id,
+                                        p_data->meta_msg.len,
+                                        p_data->meta_msg.rc_handle);
+
+            /* It's a command */
+            if (p_data->meta_msg.p_msg->hdr.ctype <= AVRC_CMD_GEN_INQ){
+
+                if (bt_rc_callbacks != NULL)
+                {
+                    /* handle the metamsg command */
+                    handle_rc_metamsg_cmd(&(p_data->meta_msg));
+                }
+                else
+                {
+                    BTIF_TRACE_ERROR("AVRCP TG role not up, drop meta commands");
+                }
+
+            } else
+            /* It's a response */
+            if (p_data->meta_msg.p_msg->hdr.ctype >= AVRC_RSP_ACCEPT)
+            {
+                if (bt_rc_ctrl_callbacks != NULL)
+                {
+                    /* handle the metamsg response */
+                    handle_rc_metamsg_rsp(&(p_data->meta_msg));
+                }
+                else
+                {
+                    BTIF_TRACE_ERROR("AVRCP CT role not up, drop meta responses");
+                }
+            }
+
+            /* Free the Memory allocated for tAVRC_MSG */
+            GKI_freebuf(p_data->meta_msg.p_msg);
         }
         break;
         default:
@@ -1176,6 +1209,30 @@ static void btif_rc_upstreams_rsp_evt(UINT16 event, tAVRC_RESPONSE *pavrc_resp, 
         }
         break;
 
+        case AVRC_PDU_GET_ELEMENT_ATTR:
+        {
+            tAVRC_GET_ELEM_ATTRS_RSP* p_rsp = &pavrc_resp->get_elem_attrs;
+            btrc_element_attr_val_t* element_attrs =
+                (btrc_element_attr_val_t*)malloc(sizeof(btrc_element_attr_val_t) * p_rsp->num_attr);
+            memset(element_attrs, 0, sizeof(btrc_element_attr_val_t) * p_rsp->num_attr);
+
+            UINT8 i;
+            for (i=0; i<p_rsp->num_attr; i++)
+            {
+                element_attrs[i].attr_id = p_rsp->p_attrs[i].attr_id;
+                memcpy(element_attrs[i].text, p_rsp->p_attrs[i].name.p_str, p_rsp->p_attrs[i].name.str_len);
+                BTIF_TRACE_DEBUG("%s attr_id:0x%x, str_len:%d, str:%s",
+                    __FUNCTION__, (unsigned int)element_attrs[i].attr_id,
+                    p_rsp->p_attrs[i].name.str_len,
+                    element_attrs[i].text);
+                free(p_rsp->p_attrs[i].name.p_str);
+            }
+            free(pavrc_resp->get_elem_attrs.p_attrs);
+            HAL_CBACK(bt_rc_ctrl_callbacks, get_element_attr_rsp_cb, p_rsp->num_attr, element_attrs);
+            free(element_attrs);
+        }
+        break;
+
         default:
             return;
     }
@@ -1500,7 +1557,7 @@ static void handle_rc_metamsg_rsp(tBTA_AV_META_MSG *pmeta_msg)
 
     if(AVRC_OP_VENDOR==pmeta_msg->p_msg->hdr.opcode &&(AVRC_RSP_CHANGED==pmeta_msg->code
       || AVRC_RSP_INTERIM==pmeta_msg->code || AVRC_RSP_ACCEPT==pmeta_msg->code
-      || AVRC_RSP_REJ==pmeta_msg->code || AVRC_RSP_NOT_IMPL==pmeta_msg->code))
+      || AVRC_RSP_REJ==pmeta_msg->code || AVRC_RSP_NOT_IMPL==pmeta_msg->code || AVRC_RSP_IMPL_STBL==pmeta_msg->code))
     {
         status=AVRC_ParsResponse(pmeta_msg->p_msg, &avrc_response, scratch_buf, sizeof(scratch_buf));
         BTIF_TRACE_DEBUG("%s: code %d,event ID %d,PDU %x,parsing status %d, label:%d",
@@ -1618,6 +1675,53 @@ static bt_status_t send_passthrough_cmd(bt_bdaddr_t *bd_addr, uint8_t key_code, 
     return status;
 }
 
+static bt_status_t get_elem_attr(bt_bdaddr_t *bd_addr, uint8_t num_attr, btrc_media_attr_t *p_attrs)
+{
+    BTIF_TRACE_DEBUG("%s", __FUNCTION__);
+    CHECK_RC_CONNECTED
+    tAVRC_STS status = BT_STATUS_UNSUPPORTED;
+
+    // TODO: It seems there is an issue in handle_rc_features, if TG role is disabled, METADATA feature is cleared.
+    btif_rc_cb.rc_features |= BTA_AV_FEAT_ADV_CTRL;
+    btif_rc_cb.rc_features |= BTA_AV_FEAT_BROWSE;
+    btif_rc_cb.rc_features |= BTA_AV_FEAT_METADATA;
+
+    BTIF_TRACE_DEBUG("Peer_features:%x", btif_rc_cb.rc_features);
+    BTIF_TRACE_DEBUG("btif_rc_cb.rc_handle:%x", btif_rc_cb.rc_handle);
+
+    if ((btif_rc_cb.rc_features & BTA_AV_FEAT_RCTG)/* &&
+        (btif_rc_cb.rc_features & BTA_AV_FEAT_METADATA)*/)
+    {
+        tAVRC_COMMAND avrc_cmd = {0};
+        BT_HDR *p_msg = NULL;
+
+        BTIF_TRACE_DEBUG("%s: Peer supports getting metadata", __FUNCTION__);
+        avrc_cmd.get_elem_attrs.opcode = AVRC_OP_VENDOR;
+        avrc_cmd.get_elem_attrs.pdu = AVRC_PDU_GET_ELEMENT_ATTR;
+        avrc_cmd.get_elem_attrs.status = AVRC_STS_NO_ERROR;
+        avrc_cmd.get_elem_attrs.num_attr = num_attr;
+        memcpy(avrc_cmd.get_elem_attrs.attrs, p_attrs, sizeof(btrc_media_attr_t) * num_attr);
+
+        if (AVRC_BldCommand(&avrc_cmd, &p_msg) == AVRC_STS_NO_ERROR)
+        {
+            /* Don't use label and transaction here */
+            BTIF_TRACE_DEBUG("%s msgreq being sent out with label %d",
+                               __FUNCTION__, 0);
+            BTA_AvMetaCmd(btif_rc_cb.rc_handle, 0, AVRC_CMD_STATUS, p_msg);
+            status =  BT_STATUS_SUCCESS;
+        }
+        else
+        {
+            BTIF_TRACE_ERROR("%s: failed to build get elem attr command. status: 0x%02x",
+                                __FUNCTION__, status);
+            status = BT_STATUS_FAIL;
+        }
+    }
+    else
+        status=BT_STATUS_NOT_READY;
+    return status;
+}
+
 static const btrc_interface_t bt_rc_interface = {
     sizeof(bt_rc_interface),
     init,
@@ -1638,6 +1742,7 @@ static const btrc_ctrl_interface_t bt_rc_ctrl_interface = {
     sizeof(bt_rc_ctrl_interface),
     init_ctrl,
     send_passthrough_cmd,
+    get_elem_attr,
     cleanup,
 };
 

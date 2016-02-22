@@ -29,6 +29,53 @@
 
 #if (AVRC_METADATA_INCLUDED == TRUE)
 
+
+/*******************************************************************************
+**
+** Function         avrc_prs_get_elem_attrs_rsp
+**
+** Description      This function parses the Get Element Attributes
+**                  response.
+**
+** Returns          AVRC_STS_NO_ERROR, if the response is parsed successfully
+**                  Otherwise, the error code.
+**
+*******************************************************************************/
+static tAVRC_STS avrc_prs_get_elem_attrs_rsp (tAVRC_GET_ELEM_ATTRS_RSP *p_rsp, UINT8 *p_data)
+{
+    UINT8   *p_start, *p_len, *p_count;
+    UINT16  len;
+    UINT8   xx;
+    UINT32  attr_id;
+
+    if (p_rsp->num_attr == 0)
+        return AVRC_STS_NO_ERROR;
+
+    AVRC_TRACE_API("avrc_prs_get_elem_attrs_rsp num_attr: %d", p_rsp->num_attr);
+
+    p_rsp->p_attrs = (tAVRC_ATTR_ENTRY*)malloc(sizeof(tAVRC_ATTR_ENTRY) * p_rsp->num_attr);
+
+    for (xx=0; xx<p_rsp->num_attr; xx++)
+    {
+        BE_STREAM_TO_UINT32(attr_id, p_data);
+        if (!AVRC_IS_VALID_MEDIA_ATTRIBUTE(attr_id))
+        {
+            AVRC_TRACE_ERROR("avrc_prs_get_elem_attrs_rsp invalid attr id[%d]: %d", xx, attr_id);
+            continue;
+        }
+
+        p_rsp->p_attrs[xx].attr_id = attr_id;
+
+        BE_STREAM_TO_UINT16(p_rsp->p_attrs[xx].name.charset_id, p_data);
+        BE_STREAM_TO_UINT16(p_rsp->p_attrs[xx].name.str_len, p_data);
+        p_rsp->p_attrs[xx].name.p_str = (UINT8*)malloc(sizeof(UINT8) * p_rsp->p_attrs[xx].name.str_len);
+        BE_STREAM_TO_ARRAY(p_data, p_rsp->p_attrs[xx].name.p_str, p_rsp->p_attrs[xx].name.str_len);
+        AVRC_TRACE_DEBUG("avrc_prs_get_elem_attrs_rsp str_len: %d, str: %s", p_rsp->p_attrs[xx].name.str_len, p_rsp->p_attrs[xx].name.p_str);
+    }
+
+    return AVRC_STS_NO_ERROR;
+}
+
 /*******************************************************************************
 **
 ** Function         avrc_pars_vendor_rsp
@@ -77,6 +124,19 @@ static tAVRC_STS avrc_pars_vendor_rsp(tAVRC_MSG_VENDOR *p_msg, tAVRC_RESPONSE *p
         else
         {
             BE_STREAM_TO_UINT8 (p_result->volume.volume, p);
+        }
+        break;
+
+    case AVRC_PDU_GET_ELEMENT_ATTR:      /* 0x20 */
+        BE_STREAM_TO_UINT8 (p_result->get_elem_attrs.num_attr, p);
+
+        AVRC_TRACE_API("num_attr: %d", p_result->get_elem_attrs.num_attr);
+
+        if (len == 0)
+            status = AVRC_STS_INTERNAL_ERR;
+        else
+        {
+            status = avrc_prs_get_elem_attrs_rsp(&p_result->get_elem_attrs, p);
         }
         break;
 #endif /* (AVRC_ADV_CTRL_INCLUDED == TRUE) */
